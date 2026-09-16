@@ -9,6 +9,10 @@
 // server's sockets and answers the ones it has a pre-rendered response for
 // right here, without ever waking up user space.
 
+// The most dummy sockets, and so the most connections the fast path runs on at
+// once, see `dummy_map`. User space sizes the maps to the pool it sets up.
+#define MAX_DUMMIES 16384
+
 // Tracks how far an upgraded connection's HTTP/2 handshake has progressed, so
 // that a connection present in the map is known to speak HTTP/2.
 struct {
@@ -19,13 +23,83 @@ struct {
 } upgraded_conns SEC(".maps");
 u32 num_upgraded_conns = 0;
 
-// The client sockets of the server, i.e. the ones `msg_verdict` runs on.
+// The sockets the server accepted, i.e. the ones `skb_verdict` runs on.
+//
+// What a client sends arrives as an sk_buff, which cannot be grown into a
+// response of any size. `skb_verdict` therefore redirects it to the egress of
+// the connection's dummy socket (see `dummy_map`), which has the psock backlog
+// send it and so runs it through `msg_verdict`. From there a request is either
+// answered, by rewriting it into the response and redirecting it to the egress
+// of the client's socket, or handed to user space by redirecting it to the
+// socket's ingress.
 struct {
     __uint(type, BPF_MAP_TYPE_SOCKHASH);
     __uint(max_entries, 16384);
     __type(key, struct ip4_conn);
     __type(value, int);
 } sock_map SEC(".maps");
+
+// The dummy sockets, i.e. the ones `msg_verdict` runs on. Each is one end of a
+// loopback connection user space set up and never reads from or writes to.
+//
+// Every connection that takes the fast path is lent a dummy of its own, so all
+// that is ever sent on it is what that client sent. This is what lets
+// `bpf_msg_apply_bytes` reach past the end of a message: the next bytes sent on
+// the dummy are guaranteed to continue the same stream. The server's writes on
+// the client's socket never pass through the program at all.
+struct {
+    __uint(type, BPF_MAP_TYPE_SOCKMAP);
+    __uint(max_entries, MAX_DUMMIES);
+    __type(key, u32);
+    __type(value, int);
+} dummy_map SEC(".maps");
+
+// The dummies no connection is holding. Filled by user space, which also puts a
+// dummy back once it has been reset, see `released_dummies`.
+struct {
+    __uint(type, BPF_MAP_TYPE_QUEUE);
+    __uint(max_entries, MAX_DUMMIES);
+    __type(value, u32);
+} free_dummies SEC(".maps");
+
+// The dummies whose connections closed. A dummy carries state over from the
+// connection it was lent to, both in its psock and in the HTTP/2 parser's
+// dynamic table, neither of which the program can reset. User space does, and
+// then returns the dummy to `free_dummies`.
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 4096 * 64);
+} released_dummies SEC(".maps");
+
+// The dummy lent to a client connection.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_DUMMIES);
+    __type(key, struct ip4_conn);
+    __type(value, u32);
+} conn_dummy SEC(".maps");
+
+// Which dummy a message was sent on, by the dummy's address. Set up by user
+// space along with the dummies themselves.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_DUMMIES);
+    __type(key, struct ip4_conn);
+    __type(value, u32);
+} dummy_idx SEC(".maps");
+
+// The client connection a dummy is lent to.
+struct dummy_owner {
+    struct ip4_conn conn;
+    u8 active;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, MAX_DUMMIES);
+    __type(key, u32);
+    __type(value, struct dummy_owner);
+} dummy_owners SEC(".maps");
 
 // The address of the server, set by user space before the program is loaded.
 volatile const u32 ip4;
@@ -634,11 +708,15 @@ static __always_inline int copy_chunk(struct sk_msg_md *msg, const u8 __arena *s
     return 0;
 }
 
-// Overwrites `msg` in place with `r`'s pre-rendered response and redirects it
-// straight back to the sender's socket (BPF_F_INGRESS), bypassing userspace
-// entirely. `sid` is the h2 stream to answer on, or 0 to serve the HTTP/1.1
-// rendering. Returns 0 on success, < 0 if the response could not be served.
-static __always_inline int serve_route(struct sk_msg_md *msg, struct ip4_conn *ikey, struct route *r, u32 sid) {
+// Overwrites the request taking up the first `req_len` bytes of `msg` with
+// `r`'s pre-rendered response and redirects it to the egress of the client's
+// socket, bypassing userspace entirely. Whatever follows the request is run through the program
+// again. `sid` is the h2 stream to answer on, or 0 to serve the HTTP/1.1
+// rendering.
+//
+// Returns 0 on success, -1 if the response could not be served and `msg` is
+// untouched, -2 if `msg` was left half rewritten and has to be dropped.
+static __always_inline int serve_route(struct sk_msg_md *msg, struct ip4_conn *ikey, struct route *r, u32 sid, u32 req_len) {
     bool is_h2 = (sid != 0);
     u32 body_len = is_h2 ? r->h2_body_len : r->body_len;
     if (body_len == 0 || body_len > MAX_ROUTE_BODY) return -1;
@@ -662,25 +740,33 @@ static __always_inline int serve_route(struct sk_msg_md *msg, struct ip4_conn *i
     }
 
     u32 orig_size = msg->size;
+    if (req_len == 0 || req_len > orig_size) return -1;
 
-    // the message has to end up holding exactly the response. growing it goes
+    // the request has to end up holding exactly the response. growing it goes
     // a chunk at a time, as a single push of the whole difference asks the
     // allocator for one contiguous block of it.
-    if (body_len > orig_size) {
+    if (body_len > req_len) {
+        u32 target = orig_size + (body_len - req_len);
+
         u32 i;
         bpf_for(i, 0, MAX_CHUNKS) {
+            // read back on every turn rather than counted up, as a counter
+            // carried across turns keeps the verifier from ever converging
             u32 size = msg->size;
-            if (size >= body_len) break;
+            if (size >= target) break;
 
-            u32 grow = body_len - size;
+            u32 grow = target - size;
             if (grow > CHUNK) grow = CHUNK;
 
-            if (bpf_msg_push_data(msg, size, grow, 0) < 0) return -1;
+            // the response grows at its end, which is where the request ended
+            u32 end = req_len + (size - orig_size);
+
+            if (bpf_msg_push_data(msg, end, grow, 0) < 0) return i == 0 ? -1 : -2;
         }
 
-        if (msg->size != body_len) return -1;
-    } else if (body_len < orig_size) {
-        if (bpf_msg_pop_data(msg, body_len, orig_size - body_len, 0) < 0) return -1;
+        if (msg->size != target) return -2;
+    } else if (body_len < req_len) {
+        if (bpf_msg_pop_data(msg, body_len, req_len - body_len, 0) < 0) return -1;
     }
 
     // the response is copied in one window at a time, each of which is pulled
@@ -695,11 +781,11 @@ static __always_inline int serve_route(struct sk_msg_md *msg, struct ip4_conn *i
         u32 len = body_len - off;
         if (len > CHUNK) len = CHUNK;
 
-        if (bpf_msg_pull_data(msg, off, off + len, 0) < 0) return -1;
+        if (bpf_msg_pull_data(msg, off, off + len, 0) < 0) return -2;
 
         u32 body_off = is_h2 ? r->h2_body_off : r->body_off;
 
-        if (copy_chunk(msg, arena_at(body_off + off), len) < 0) return -1;
+        if (copy_chunk(msg, arena_at(body_off + off), len) < 0) return -2;
     }
 
     // the rendered frames carry a zeroed stream id, the one of the request
@@ -712,11 +798,11 @@ static __always_inline int serve_route(struct sk_msg_md *msg, struct ip4_conn *i
             u32 j = i;
             bpf_clamp_uminmax(j, 0, MAX_SID_OFFS - 1);
 
-            if (write_sid(msg, r->h2_sid_offs[j], sid) < 0) return -1;
+            if (write_sid(msg, r->h2_sid_offs[j], sid) < 0) return -2;
         }
     }
 
-    if (bpf_msg_redirect_hash(msg, &sock_map, ikey, BPF_F_INGRESS) < 0) return -1;
+    if (bpf_msg_redirect_hash(msg, &sock_map, ikey, 0) != SK_PASS) return -2;
 
     bpf_msg_apply_bytes(msg, body_len);
 
@@ -733,8 +819,8 @@ static __always_inline int serve_route(struct sk_msg_md *msg, struct ip4_conn *i
 // Looks up the captured request path in `route_idx` and, on a match, serves
 // the pre-rendered response directly from the fast path. Returns 0 if a route
 // was served (the caller should return SK_PASS immediately without further
-// processing `msg`), < 0 otherwise.
-static __always_inline int try_serve_route(struct sk_msg_md *msg, struct ip4_conn *ikey, struct hdr_str *path, u32 sid) {
+// processing `msg`), < 0 otherwise, see `serve_route`.
+static __always_inline int try_serve_route(struct sk_msg_md *msg, struct ip4_conn *ikey, struct hdr_str *path, u32 sid, u32 req_len) {
     if (path->len == 0 || path->len > MAX_ROUTE_PATH) return -1;
 
     u32 len = path->len;
@@ -752,7 +838,15 @@ static __always_inline int try_serve_route(struct sk_msg_md *msg, struct ip4_con
     u32 i = *idx;
     bpf_clamp_uminmax(i, 0, MAX_ROUTES - 1);
 
-    return serve_route(msg, ikey, &routes[i], sid);
+    return serve_route(msg, ikey, &routes[i], sid, req_len);
+}
+
+// Hands the next `len` bytes the client sent to user space, which may reach
+// past the end of `msg`, see `dummy_map`.
+static __always_inline int to_user_space(struct sk_msg_md *msg, struct ip4_conn *conn, u32 len) {
+    bpf_msg_apply_bytes(msg, len);
+
+    return bpf_msg_redirect_hash(msg, &sock_map, conn, BPF_F_INGRESS);
 }
 
 // Returns the value of the captured `Content-Length` header, or -1 if it is
@@ -780,8 +874,9 @@ static __always_inline int parse_content_length(const struct hdr_str *content_le
 // user space server.
 SEC("sk_msg")
 int msg_verdict(struct sk_msg_md *msg) {
-    // socket identifier of the ingress connection
-    struct ip4_conn ikey = {
+    // the dummy the message was sent on. the HTTP/2 parser keys its state by
+    // the address of the socket it runs on, which is this one.
+    struct ip4_conn dkey = {
         .local = {
             .ip4 = msg->local_ip4,
             .port = msg->local_port
@@ -792,8 +887,17 @@ int msg_verdict(struct sk_msg_md *msg) {
         }
     };
 
-    bool is_downstream = (ikey.remote.ip4 == ip4 && ikey.remote.port == port);
-    bpf_debug("Processing %dB msg from [%pI4:%u->%pI4:%u] (downstream: %d)", msg->size, &ikey.local.ip4, ikey.local.port, &ikey.remote.ip4, ikey.remote.port, is_downstream);
+    u32 *dummy = bpf_map_lookup_elem(&dummy_idx, &dkey);
+    if (!dummy) return SK_DROP;
+
+    struct dummy_owner *owner = bpf_map_lookup_elem(&dummy_owners, dummy);
+    // what is left over from a connection that closed has nowhere to go
+    if (!owner || !owner->active) return SK_DROP;
+
+    // socket identifier of the client connection
+    struct ip4_conn ikey = owner->conn;
+
+    bpf_debug("Processing %dB msg from [%pI4:%u->%pI4:%u]", msg->size, &ikey.remote.ip4, ikey.remote.port, &ikey.local.ip4, ikey.local.port);
 
     int *conn_state = bpf_map_lookup_elem(&upgraded_conns, &ikey);
     bool is_h2 = (conn_state != NULL);
@@ -868,9 +972,7 @@ int msg_verdict(struct sk_msg_md *msg) {
                 bpf_map_update_elem(&flow_ctl, &ikey, &flow, BPF_ANY);
 
                 // the H2 preface is 24 bytes long
-                bpf_msg_apply_bytes(msg, 24);
-
-                return SK_PASS;
+                return to_user_space(msg, &ikey, 24);
             }
 
             struct hdr_str content_length = { 0 };
@@ -900,8 +1002,14 @@ int msg_verdict(struct sk_msg_md *msg) {
         can_serve = false;
     }
 
-    if (can_serve) {
-        if (try_serve_route(msg, &ikey, &path, sid) == 0) {
+    if (can_serve && msg_len > 0) {
+        int served = try_serve_route(msg, &ikey, &path, sid, msg_len);
+        if (served < -1) {
+            bpf_error("Failed to serve request, dropping it");
+            return SK_DROP;
+        }
+
+        if (served == 0) {
             bpf_debug("Served request");
 
             // user space knows nothing of this request, and the header block
@@ -912,6 +1020,7 @@ int msg_verdict(struct sk_msg_md *msg) {
                 bpf_map_update_elem(&dt_dirty, &ikey, &dirty, BPF_ANY);
             }
 
+            // the redirect to the client's socket was set up while serving
             return SK_PASS;
         }
     }
@@ -921,7 +1030,7 @@ int msg_verdict(struct sk_msg_md *msg) {
     // rebuilds the table from it and then decodes the message against it,
     // ending up exactly where the fast path's mirror is.
     if (is_h2 && msg_len >= 0 && dt_stale) {
-        int synced = prepend_dt_sync(msg, &ikey, dt_count);
+        int synced = prepend_dt_sync(msg, &dkey, dt_count);
         if (synced < 0) {
             bpf_error("Failed to sync dynamic table, dropping connection");
 
@@ -958,38 +1067,137 @@ int msg_verdict(struct sk_msg_md *msg) {
         }
     }
 
-    bpf_msg_apply_bytes(msg, msg_len);
+    // a message that could not be parsed continues in a later sk_buff, where
+    // there is no telling where the next one starts. the rest of the connection
+    // is left to user space.
+    if (msg_len <= 0) {
+        bpf_debug("Failed to parse msg, handing the connection to user space");
 
-    return SK_PASS;
+        return to_user_space(msg, &ikey, 0xFFFFFFFF);
+    }
+
+    return to_user_space(msg, &ikey, msg_len);
+}
+
+// Sends what the client sent through `msg_verdict`, see `sock_map`.
+SEC("sk_skb/stream_verdict")
+int skb_verdict(struct __sk_buff *skb) {
+    struct ip4_conn ikey = {
+        .local = {
+            .ip4 = skb->local_ip4,
+            .port = skb->local_port
+        },
+        .remote = {
+            .ip4 = skb->remote_ip4,
+            .port = bpf_ntohl(skb->remote_port)
+        }
+    };
+
+    // a socket is only added once it holds a dummy, and only loses it once it
+    // is closed
+    u32 *dummy = bpf_map_lookup_elem(&conn_dummy, &ikey);
+    if (!dummy) return SK_DROP;
+
+    // the end of the stream arrives as an empty sk_buff. the backlog takes
+    // sending nothing for a broken pipe, which would leave the dummy unusable
+    // for every connection after this one, so it goes to user space directly.
+    if (skb->len == 0) return SK_PASS;
+
+    // the backlog sends the linear part and every fragment of an sk_buff with a
+    // sendmsg of their own. `msg_verdict` copes with either, but one message is
+    // cheaper to run it on than several.
+    if (bpf_skb_pull_data(skb, skb->len) < 0) {
+        bpf_debug("Failed to linearize %uB skb", skb->len);
+    }
+
+    return bpf_sk_redirect_map(skb, &dummy_map, *dummy, 0);
+}
+
+// Lends a dummy to a connection the server accepted and adds it to `sock_map`.
+// A connection that finds no dummy left is served by user space alone.
+static __always_inline void add_conn(struct bpf_sock_ops *ops, struct ip4_conn *key) {
+    u32 dummy;
+    if (bpf_map_pop_elem(&free_dummies, &dummy) < 0) {
+        bpf_warn("No dummy left for [%pI4:%u->%pI4:%u], leaving it to user space", &key->remote.ip4, key->remote.port, &key->local.ip4, key->local.port);
+        return;
+    }
+
+    struct dummy_owner owner = { .conn = *key, .active = 1 };
+    if (bpf_map_update_elem(&dummy_owners, &dummy, &owner, BPF_ANY) < 0) goto release;
+    if (bpf_map_update_elem(&conn_dummy, key, &dummy, BPF_ANY) < 0) goto release;
+
+    // the dummy has to be given back once the connection closes
+    if (bpf_sock_ops_cb_flags_set(ops, BPF_SOCK_OPS_STATE_CB_FLAG) < 0) goto release;
+
+    if (bpf_sock_hash_update(ops, &sock_map, key, BPF_ANY) < 0) {
+        bpf_error("Failed to add socket [%pI4:%u->%pI4:%u]", &key->local.ip4, key->local.port, &key->remote.ip4, key->remote.port);
+        goto release;
+    }
+
+    bpf_debug("Added socket [%pI4:%u->%pI4:%u] with dummy %u", &key->local.ip4, key->local.port, &key->remote.ip4, key->remote.port, dummy);
+
+    return;
+
+release:
+    // the dummy was never used, so it can go straight back
+    bpf_sock_ops_cb_flags_set(ops, 0);
+    bpf_map_delete_elem(&conn_dummy, key);
+    owner.active = 0;
+    bpf_map_update_elem(&dummy_owners, &dummy, &owner, BPF_ANY);
+    bpf_map_push_elem(&free_dummies, &dummy, BPF_ANY);
+}
+
+// Takes the dummy back from a connection that closed, along with the state the
+// fast path kept for it.
+static __always_inline void remove_conn(struct ip4_conn *key) {
+    u32 *found = bpf_map_lookup_elem(&conn_dummy, key);
+    if (!found) return;
+
+    u32 dummy = *found;
+    bpf_map_delete_elem(&conn_dummy, key);
+
+    // whatever the dummy still has queued is dropped from here on
+    struct dummy_owner owner = { .conn = *key, .active = 0 };
+    bpf_map_update_elem(&dummy_owners, &dummy, &owner, BPF_ANY);
+
+    bpf_map_delete_elem(&upgraded_conns, key);
+    bpf_map_delete_elem(&flow_ctl, key);
+    bpf_map_delete_elem(&dt_dirty, key);
+
+    if (bpf_ringbuf_output(&released_dummies, &dummy, sizeof(dummy), 0) < 0) {
+        bpf_error("Failed to release dummy %u, it is lost to the pool", dummy);
+        return;
+    }
+
+    bpf_debug("Released dummy %u of [%pI4:%u->%pI4:%u]", dummy, &key->local.ip4, key->local.port, &key->remote.ip4, key->remote.port);
 }
 
 SEC("sockops")
 int monitor_sockets(struct bpf_sock_ops *ops) {
-    if (ops->op == BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB || ops->op == BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB) {
-        // we don't want to get called anymore for this connection
-        bpf_sock_ops_cb_flags_set(ops, 0);
+    if (ops->op != BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB && ops->op != BPF_SOCK_OPS_STATE_CB) {
+        return SK_PASS;
+    }
 
-        struct ip4_conn skey = {
-            .local = {
-                .ip4 = ops->local_ip4,
-                .port = ops->local_port
-            },
-            .remote = {
-                .ip4 = ops->remote_ip4,
-                .port = bpf_ntohl(ops->remote_port)
-            }
-        };
-
-        bpf_debug("Established socket [%pI4:%u->%pI4:%u]", &skey.local.ip4, skey.local.port, &skey.remote.ip4, skey.remote.port);
-
-        if (skey.remote.ip4 == ip4 && skey.remote.port == port) {
-            if (bpf_sock_hash_update(ops, &sock_map, &skey, BPF_ANY) < 0) {
-                bpf_error("Failed to add socket [%pI4:%u->%pI4:%u]", &skey.local.ip4, skey.local.port, &skey.remote.ip4, skey.remote.port);
-                return SK_PASS;
-            }
-
-            bpf_debug("Add socket [%pI4:%u->%pI4:%u]", &skey.local.ip4, skey.local.port, &skey.remote.ip4, skey.remote.port);
+    struct ip4_conn skey = {
+        .local = {
+            .ip4 = ops->local_ip4,
+            .port = ops->local_port
+        },
+        .remote = {
+            .ip4 = ops->remote_ip4,
+            .port = bpf_ntohl(ops->remote_port)
         }
+    };
+
+    if (ops->op == BPF_SOCK_OPS_STATE_CB) {
+        if (ops->args[1] == BPF_TCP_CLOSE) remove_conn(&skey);
+
+        return SK_PASS;
+    }
+
+    // a server bound to the unspecified address accepts on all of them
+    if ((ip4 == 0 || skey.local.ip4 == ip4) && skey.local.port == port) {
+        add_conn(ops, &skey);
     }
 
     return SK_PASS;

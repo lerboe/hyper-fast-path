@@ -1,11 +1,16 @@
 //! A static file server whose requests can be answered from the kernel.
 
-use beeper_axum::{OpenObject, fast_path::FastPath, listener::BeeperListener, server};
+use beeper_axum::{
+    OpenObject,
+    fast_path::{self, FastPath},
+    listener::BeeperListener,
+    server,
+};
 use clap::Parser;
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 use tokio::net::TcpListener;
 use tower_http::{services::ServeDir, trace::TraceLayer};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::EnvFilter;
 
 /// A static file server that can answer its smaller assets from eBPF.
 #[derive(Parser)]
@@ -18,6 +23,10 @@ struct Args {
     /// The address to listen on.
     #[arg(short, long, default_value = "127.0.0.1:8080")]
     addr: SocketAddr,
+
+    /// The number of connections the fast path runs on at once.
+    #[arg(long, default_value_t = fast_path::DEFAULT_DUMMIES)]
+    dummies: usize,
 }
 
 /// All assets that are served with the fast path.
@@ -43,17 +52,8 @@ fn fastpath_routes(assets_dir: &str) -> HashMap<String, PathBuf> {
 async fn main() {
     let args = Args::parse();
 
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                format!(
-                    "{}=debug,bpf=trace,tower_http=debug",
-                    env!("CARGO_CRATE_NAME")
-                )
-                .into()
-            }),
-        )
-        .with(tracing_subscriber::fmt::layer())
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
         .init();
 
     let assets_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/assets");
@@ -71,7 +71,7 @@ async fn main() {
         None
     } else {
         let routes = fastpath_routes(assets_dir);
-        Some(FastPath::attach(args.addr, &mut open_obj, routes).expect("attach"))
+        Some(FastPath::attach(args.addr, &mut open_obj, routes, args.dummies).expect("attach"))
     };
 
     let listener = TcpListener::bind(args.addr).await.unwrap();

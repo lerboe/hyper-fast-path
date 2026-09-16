@@ -1,4 +1,5 @@
 #![allow(unused_imports)]
+use crate::dummies::{DummyMaps, DummyPool, find_dynamic_table_info};
 use anyhow::{Context, Result, bail};
 use beeper::{h1, h2};
 use httlib_huffman as huffman;
@@ -15,7 +16,7 @@ use std::{
 };
 use tracing::{Level, debug, info};
 use xbpf::libbpf::{
-    self as libbpf_rs, Link, MapCore, MapFlags,
+    self as libbpf_rs, Link, MapCore, MapFlags, MapHandle,
     skel::{OpenSkel, Skel, SkelBuilder},
 };
 
@@ -38,8 +39,14 @@ const MAX_SID_OFFS: usize = 32;
 /// largest DATA frame that is safe to send without having seen its settings.
 const MAX_FRAME_SIZE: usize = 16384;
 
+const MAX_DUMMIES: usize = 16384;
+
 const ARENA_BASE: usize = 1 << 44;
 const PAGE_SIZE: usize = 4096;
+
+/// The number of connections the fast path runs on at once unless told
+/// otherwise, see [`FastPath::attach`].
+pub const DEFAULT_DUMMIES: usize = 1024;
 
 /// The eBPF fast path of a server.
 ///
@@ -48,6 +55,8 @@ const PAGE_SIZE: usize = 4096;
 /// straight from the kernel. Everything else is passed on to the user space
 /// server. The fast path stays attached until this value is dropped.
 pub struct FastPath<'obj> {
+    #[allow(dead_code)]
+    dummies: DummyPool,
     #[allow(dead_code)]
     skel: FastPathSkel<'obj>,
     #[allow(dead_code)]
@@ -184,11 +193,20 @@ impl<'obj> FastPath<'obj> {
     /// loaded into the eBPF program's `.bss` section, so that requests for a
     /// matching path can be served directly from the fast path without ever
     /// reaching userspace.
+    ///
+    /// `dummies` is the number of connections the fast path runs on at once,
+    /// each of which takes up a loopback connection of its own. Connections
+    /// beyond that are served by userspace alone.
     pub fn attach<A: ToSocketAddrs>(
         address: A,
         open_obj: &'obj mut MaybeUninit<libbpf_rs::OpenObject>,
         routes: HashMap<String, PathBuf>,
+        dummies: usize,
     ) -> Result<Self> {
+        if dummies == 0 || dummies > MAX_DUMMIES {
+            bail!("the fast path runs on 1 to {MAX_DUMMIES} connections, {dummies} requested");
+        }
+
         if routes.len() > MAX_ROUTES {
             bail!(
                 "too many fastpath routes: {} configured, at most {MAX_ROUTES} supported",
@@ -263,6 +281,7 @@ impl<'obj> FastPath<'obj> {
         let mut open_skel = skel_builder.open(open_obj)?;
         if tracing::event_enabled!(Level::TRACE) {
             open_skel.progs.msg_verdict.set_log_level(1);
+            open_skel.progs.skb_verdict.set_log_level(1);
         }
 
         let ip4 = match address {
@@ -299,6 +318,17 @@ impl<'obj> FastPath<'obj> {
         let pages = arena_len.div_ceil(PAGE_SIZE).max(1);
         open_skel.maps.arena.set_max_entries(pages as u32)?;
 
+        let maps = &mut open_skel.maps;
+        for map in [
+            &mut maps.dummy_map,
+            &mut maps.free_dummies,
+            &mut maps.conn_dummy,
+            &mut maps.dummy_idx,
+            &mut maps.dummy_owners,
+        ] {
+            map.set_max_entries(dummies as u32)?;
+        }
+
         let skel = open_skel.load()?;
         xbpf::tracing::try_init(skel.object())?;
 
@@ -331,6 +361,7 @@ impl<'obj> FastPath<'obj> {
             }
         }
         let sock_map_fd = skel.maps.sock_map.as_fd().as_raw_fd();
+        let dummy_map_fd = skel.maps.dummy_map.as_fd().as_raw_fd();
         let prog_fd = skel.progs.msg_verdict.as_fd().as_raw_fd();
 
         let h1 = h1::Parser::new()
@@ -356,12 +387,26 @@ impl<'obj> FastPath<'obj> {
             .open("/sys/fs/cgroup")?
             .into_raw_fd();
 
+        // a socket only picks up the programs attached to the map by the time it
+        // is added, so they have to be in place before any socket is
+        skel.progs.msg_verdict.attach_sockmap(dummy_map_fd)?;
+        skel.progs.skb_verdict.attach_sockmap(sock_map_fd)?;
+
+        let maps = DummyMaps {
+            dummy_map: MapHandle::try_from(&skel.maps.dummy_map)?,
+            dummy_idx: MapHandle::try_from(&skel.maps.dummy_idx)?,
+            free_dummies: MapHandle::try_from(&skel.maps.free_dummies)?,
+            released_dummies: MapHandle::try_from(&skel.maps.released_dummies)?,
+            dynamic_table_info: find_dynamic_table_info(skel.progs.msg_verdict.as_fd())?,
+        };
+        let dummies = DummyPool::new(dummies, maps)?;
+
         let sockops = skel.progs.monitor_sockets.attach_cgroup(cgroup_fd)?;
-        skel.progs.msg_verdict.attach_sockmap(sock_map_fd)?;
 
         debug!("Server fast path attached");
 
         Ok(Self {
+            dummies,
             sockops,
             skel,
             h1,
