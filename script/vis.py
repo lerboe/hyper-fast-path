@@ -132,7 +132,8 @@ def export_plot(exp, http2, x_axis, max_x, disabled):
     ax.set_ylabel("Request Latency [ms]")
 
     if x_axis == "rps":
-        ax.set_xlim(left=2000, right=max_x)
+        min_x = df[column].min()
+        ax.set_xlim(left=min_x, right=max_x)
         ax.set_xticks(_x_ticks(*ax.get_xlim()))
         ax.xaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x / 1000:g}k"))
     else:

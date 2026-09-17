@@ -41,7 +41,7 @@ function start_server {
 }
 
 function load {
-    taskset -c 2 oha "$@" -c 100 -z 30s --latency-correction
+    taskset -c 2 oha "$@" -c 100 -z 15s --latency-correction
 }
 
 function teardown {
