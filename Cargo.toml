@@ -1,17 +1,17 @@
 [workspace]
 resolver = "2"
-members = ["beeper-axum", "example"]
+members = ["hyper-fast-path", "example"]
 
 [workspace.package]
 license = "GPL-3.0"
 authors = [
     "lerboe <mail@laurinbrandner.ch>",
 ]
-repository = "https://github.com/lerboe/beeper-axum"
+repository = "https://github.com/lerboe/hyper-fast-path"
 readme = "README.md"
 keywords = ["ebpf", "bpf", "libbpf", "l7", "http"]
 description = "Application-Layer Parsing in eBPF"
 categories = ["network-programming"]
 
 [patch.crates-io]
-h2 = { path = "../h2" }
+h2 = { git = "https://github.com/lerboe/h2.git" }

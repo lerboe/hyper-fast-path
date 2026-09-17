@@ -271,8 +271,8 @@ done
 
 echo
 if ((FAILED > 0)); then
-    cp "$LOG" /tmp/beeper-axum-test-server.log
-    echo -e "${COLOR_RED}$FAILED failed${COLOR_OFF}, $PASSED passed (server log in /tmp/beeper-axum-test-server.log)"
+    cp "$LOG" /tmp/hyper-fast-path-test-server.log
+    echo -e "${COLOR_RED}$FAILED failed${COLOR_OFF}, $PASSED passed (server log in /tmp/hyper-fast-path-test-server.log)"
     exit 1
 fi
 

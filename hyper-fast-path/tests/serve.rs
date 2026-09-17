@@ -6,7 +6,7 @@
 //! sync frame is written onto the wire by the test itself.
 
 use axum::{Router, routing::get};
-use beeper_axum::{listener::BeeperListener, server};
+use hyper_fast_path::{listener::BeeperListener, server};
 use httlib_huffman as huffman;
 use http::HeaderValue;
 use std::net::SocketAddr;

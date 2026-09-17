@@ -1,6 +1,6 @@
 //! A static file server whose requests can be answered from the kernel.
 
-use beeper_axum::{
+use hyper_fast_path::{
     OpenObject,
     fast_path::{self, FastPath},
     listener::BeeperListener,

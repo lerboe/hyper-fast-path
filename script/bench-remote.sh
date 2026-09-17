@@ -36,7 +36,7 @@ OUT_DIR=$RES_DIR/$NAME
 # the address the load generator reaches this machine under
 SERVER_HOST=${SERVER_HOST:-$(uname -n)}
 SERVER_PORT=${SERVER_PORT:-8080}
-LOAD_GEN_DIR=/tmp/beeper-axum-bench
+LOAD_GEN_DIR=/tmp/hyper-fast-path-bench
 
 if [[ $(ulimit -n) -lt 10000 ]]; then
     echo -e "${COLOR_RED}Low open files limit ($(ulimit -n)). Please increase and try again.${COLOR_OFF}"
