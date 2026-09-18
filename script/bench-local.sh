@@ -41,7 +41,7 @@ function start_server {
 }
 
 function load {
-    taskset -c 2 oha "$@" -c 100 -z 15s --latency-correction
+    taskset -c 2 oha "$@" -c 100 -z 10s --latency-correction
 }
 
 function teardown {
@@ -57,7 +57,6 @@ cargo b -r --bin example
 
 TESTS=(bl fp sp)
 PROTOS=("" --http2)
-QPS=(2000 4000 6000 8000 10000 12000 14000 16000 18000 20000)
 FILE_SIZES=(8KB 16KB 32KB 48KB 64KB)
 
 mkdir -p "$OUT_DIR"
@@ -73,7 +72,7 @@ for test in "${TESTS[@]}"; do
 
     for proto in "${PROTOS[@]}"; do
         for size in "${FILE_SIZES[@]}"; do
-            for qps in "${QPS[@]}"; do
+            for qps in {500..20000..2000}; do
                 log=$OUT_DIR/$test${proto:+-http2}-${size}-${qps}.log
                 req=http://127.0.0.1:8080/${size}${SUFFIX}.txt
 

@@ -1076,7 +1076,21 @@ int msg_verdict(struct sk_msg_md *msg) {
         return to_user_space(msg, &ikey, 0xFFFFFFFF);
     }
 
-    return to_user_space(msg, &ikey, msg_len);
+    // `msg_len` is only ever the one frame (or request) that was just parsed.
+    // Forwarding just that much would have the leftover run back through this
+    // program, and a message that bundles several frames none of which can be
+    // served -- the client's initial SETTINGS, a WINDOW_UPDATE and a request
+    // sent before the handshake completes routinely all arrive together --
+    // would then redirect into the same socket several times in a row for one
+    // sk_buff. That back-to-back redirecting has been observed to stall the
+    // socket on the receiving end. Once one frame can't be served there is
+    // nothing to gain from re-parsing the rest of this message frame by frame,
+    // so everything already buffered goes over in a single redirect instead;
+    // `msg_len` still wins when it reaches past the buffered part, which is
+    // how a request whose body has not fully arrived reserves it.
+    u32 fwd_len = msg->size > (u32)msg_len ? msg->size : (u32)msg_len;
+
+    return to_user_space(msg, &ikey, fwd_len);
 }
 
 // Sends what the client sent through `msg_verdict`, see `sock_map`.
