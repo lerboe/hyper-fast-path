@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 axum = "0.8.9"
-beeper = { version = "0.1.2", features = ["h1", "h2"] }
+beeper = { version = "0.1.3", features = ["h1", "h2"] }
 bytes = "1"
 # h2 is patched to allow beeper to modify the dynamic table
 h2 = "0.4.16"
@@ -22,7 +22,7 @@ tracing = "0.1.44"
 xbpf = "0.0.3"
 
 [build-dependencies]
-beeper = { version = "0.1.2", features = ["build"] }
+beeper = { version = "0.1.3", features = ["build"] }
 xbpf = { version = "0.0.3", features = ["build"] }
 
 [dev-dependencies]

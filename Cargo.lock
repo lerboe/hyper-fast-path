@@ -148,11 +148,10 @@ dependencies = [
 
 [[package]]
 name = "beeper"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "991356651609b5f0a571d937bb30a53e6d1dcf7e09473252c63182528c5a4b88"
+checksum = "9cff1f32cd7a42dd98be3825cc5b76967bbdebd4b056deefbc11b9f88752b9b1"
 dependencies = [
- "anyhow",
  "as-bytes",
  "bytes",
  "httlib-huffman",

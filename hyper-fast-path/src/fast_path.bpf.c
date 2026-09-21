@@ -105,6 +105,14 @@ struct {
 volatile const u32 ip4;
 volatile const u32 port;
 
+// The matches the parsers are configured with, set by user space to the ids
+// beeper handed out for them before the program is loaded.
+volatile const u8 h1_preface_mid;
+volatile const u8 h1_path_mid;
+volatile const u8 h1_content_length_mid;
+volatile const u8 h2_path_mid;
+volatile const u8 h2_content_length_mid;
+
 // Fast path routing table: a fixed-size, userspace-populated table (backed by
 // the program's .bss section) holding pre-rendered HTTP responses. Populated by
 // userspace before the program is attached.
@@ -143,14 +151,6 @@ volatile const u32 port;
 #define ARENA_PAGES (MAX_ROUTES * 2 * MAX_ROUTE_BODY / 4096)
 
 #define __arena __attribute__((address_space(1)))
-
-// The matches the parsers are configured with, in the order in which user
-// space captures them.
-#define H1_PREFACE_MID 0
-#define H1_PATH_MID 1
-#define H1_CONTENT_LENGTH_MID 2
-#define H2_PATH_MID 0
-#define H2_CONTENT_LENGTH_MID 1
 
 #define H2_SETTINGS_FRAME 0x04
 #define H2_WINDOW_UPDATE_FRAME 0x08
@@ -249,6 +249,9 @@ struct {
 // many bytes each of them takes up.
 #define MAX_SETTINGS 16
 #define H2_SETTING_LEN 6
+
+// The most frames of one message the fast path follows the flow control of.
+#define MAX_FLOW_FRAMES 16
 
 // How much of a connection's flow control the fast path may spend.
 //
@@ -357,11 +360,11 @@ struct {
 
 // The functions beeper replaces with an HTTP/1.1 parser.
 BEEPER_MATCHED(matched_h1)
-BEEPER_EXTRACT_MATCH(extract_h1_match)
+BEEPER_EXTRACT_MATCH_MSG(extract_h1_match)
 BEEPER_H1_PARSE_MSG(parse_h1)
 
 // The functions beeper replaces with an HTTP/2 parser.
-BEEPER_EXTRACT_MATCH(extract_h2_match)
+BEEPER_EXTRACT_MATCH_MSG(extract_h2_match)
 BEEPER_H2_PARSE_MSG(parse_h2)
 BEEPER_H2_GET_DT_ENTRY(get_dt_entry)
 
@@ -523,19 +526,12 @@ static __always_inline int prepend_dt_sync(struct sk_msg_md *msg, const struct i
     return frame_len;
 }
 
-// Follows the SETTINGS or WINDOW_UPDATE frame `msg` carries into the flow
-// control the fast path spends from.
-//
-// The payload is read straight off the message, so this invalidates whatever
-// the parser captured out of it. Neither frame carries a request, so there is
-// nothing left to extract from one anyway.
-static __always_inline void track_flow(struct sk_msg_md *msg, const struct ip4_conn *conn, const struct h2_frame *frame) {
-    struct h2_flow *fc = bpf_map_lookup_elem(&flow_ctl, conn);
-    if (!fc) return;
-
-    u32 want = (frame->type == H2_WINDOW_UPDATE_FRAME) ? 13 : 9 + MAX_SETTINGS * H2_SETTING_LEN;
-    if (want > msg->size) want = msg->size;
-    if (bpf_msg_pull_data(msg, 0, want, 0) < 0) return;
+// Follows the SETTINGS or WINDOW_UPDATE frame at `off` into the flow control
+// the fast path spends from.
+static __always_inline void track_flow_frame(struct sk_msg_md *msg, struct h2_flow *fc, u32 off, u8 type, u8 flags, u32 sid) {
+    u32 end = off + ((type == H2_WINDOW_UPDATE_FRAME) ? 13 : 9 + MAX_SETTINGS * H2_SETTING_LEN);
+    if (end > msg->size) end = msg->size;
+    if (bpf_msg_pull_data(msg, off, end, 0) < 0) return;
 
     u8 *data = (u8 *)(long)msg->data;
     u8 *data_end = (u8 *)(long)msg->data_end;
@@ -543,11 +539,11 @@ static __always_inline void track_flow(struct sk_msg_md *msg, const struct ip4_c
 
     u32 payload_len = ((u32)data[0] << 16) | ((u32)data[1] << 8) | data[2];
 
-    if (frame->type == H2_WINDOW_UPDATE_FRAME) {
+    if (type == H2_WINDOW_UPDATE_FRAME) {
         // a window update for a stream the fast path answered on is worth
         // nothing: that stream is closed and its window can never be spent
         // again. only the connection level one carries over.
-        if (frame->sid != 0 || payload_len != 4) return;
+        if (sid != 0 || payload_len != 4) return;
         if (data + 13 > data_end) return;
 
         // the reserved bit is not part of the increment
@@ -562,7 +558,7 @@ static __always_inline void track_flow(struct sk_msg_md *msg, const struct ip4_c
         return;
     }
 
-    if (frame->flags & H2_ACK_FLAG) return;
+    if (flags & H2_ACK_FLAG) return;
 
     u32 n = payload_len / H2_SETTING_LEN;
     if (n > MAX_SETTINGS) n = MAX_SETTINGS;
@@ -585,6 +581,45 @@ static __always_inline void track_flow(struct sk_msg_md *msg, const struct ip4_c
         fc->stream_window = val;
 
         bpf_trace("flow: stream window is %u", fc->stream_window);
+    }
+}
+
+// Follows every SETTINGS and WINDOW_UPDATE frame `msg` carries into the flow
+// control the fast path spends from.
+//
+// A message handed to user space goes over whole, so the frames bundled behind
+// the one the parser looked at never run through the program on their own. A
+// client's opening SETTINGS routinely arrives with the WINDOW_UPDATE that opens
+// its connection window, and missing that one keeps the fast path from ever
+// answering more than the initial 64KB.
+//
+// The frames are read straight off the message, so this invalidates whatever
+// the parser captured out of it.
+static __always_inline void track_flow(struct sk_msg_md *msg, const struct ip4_conn *conn) {
+    struct h2_flow *fc = bpf_map_lookup_elem(&flow_ctl, conn);
+    if (!fc) return;
+
+    u32 off = 0;
+    u32 i;
+    bpf_for(i, 0, MAX_FLOW_FRAMES) {
+        u32 size = msg->size;
+        if (off + 9 > size) break;
+        if (bpf_msg_pull_data(msg, off, off + 9, 0) < 0) break;
+
+        u8 *data = (u8 *)(long)msg->data;
+        u8 *data_end = (u8 *)(long)msg->data_end;
+        if (data + 9 > data_end) break;
+
+        u32 payload_len = ((u32)data[0] << 16) | ((u32)data[1] << 8) | data[2];
+        u8 type = data[3];
+        u8 flags = data[4];
+        u32 sid = (((u32)data[5] << 24) | ((u32)data[6] << 16) | ((u32)data[7] << 8) | data[8]) & H2_MAX_WINDOW;
+
+        if (type == H2_SETTINGS_FRAME || type == H2_WINDOW_UPDATE_FRAME) {
+            track_flow_frame(msg, fc, off, type, flags, sid);
+        }
+
+        off += 9 + payload_len;
     }
 }
 
@@ -939,26 +974,23 @@ int msg_verdict(struct sk_msg_md *msg) {
                 bpf_map_update_elem(&upgraded_conns, &ikey, &h2_state, BPF_ANY);
             }
 
-            if (frame.type == H2_SETTINGS_FRAME || frame.type == H2_WINDOW_UPDATE_FRAME) {
-                track_flow(msg, &ikey, &frame);
-            }
-            else {
+            if (frame.type != H2_SETTINGS_FRAME && frame.type != H2_WINDOW_UPDATE_FRAME) {
                 struct hdr_str content_length = { 0 };
-                if (extract_h2_match(msg, &pres, H2_CONTENT_LENGTH_MID, &content_length) == 0) {
+                if (extract_h2_match(msg, &pres, h2_content_length_mid, &content_length) == 0) {
                     bpf_trace("content length: %s", content_length.ptr);
 
                     int res = parse_content_length(&content_length);
                     if (res > 0) msg_len += res;
                 }
 
-                path_res = extract_h2_match(msg, &pres, H2_PATH_MID, &path);
+                path_res = extract_h2_match(msg, &pres, h2_path_mid, &path);
             }
         }
     }
     else {
         msg_len = parse_h1(msg, &pres);
         if (msg_len > 0) {
-            if (matched_h1(msg, &pres, H1_PREFACE_MID)) {
+            if (matched_h1(&pres, h1_preface_mid)) {
                 bpf_trace("Upgrading connection to HTTP/2");
 
                 int val = H2_UPGRADED;
@@ -976,14 +1008,14 @@ int msg_verdict(struct sk_msg_md *msg) {
             }
 
             struct hdr_str content_length = { 0 };
-            if (extract_h1_match(msg, &pres, H1_CONTENT_LENGTH_MID, &content_length) == 0) {
+            if (extract_h1_match(msg, &pres, h1_content_length_mid, &content_length) == 0) {
                 bpf_trace("content length: %s", content_length.ptr);
 
                 int res = parse_content_length(&content_length);
                 if (res > 0) msg_len += res;
             }
 
-            path_res = extract_h1_match(msg, &pres, H1_PATH_MID, &path);
+            path_res = extract_h1_match(msg, &pres, h1_path_mid, &path);
         }
     }
 
@@ -1023,6 +1055,12 @@ int msg_verdict(struct sk_msg_md *msg) {
             // the redirect to the client's socket was set up while serving
             return SK_PASS;
         }
+    }
+
+    // the message goes to user space whole, and whatever flow control it
+    // carries is only seen here. this has to run before anything is prepended.
+    if (is_h2 && msg_len >= 0) {
+        track_flow(msg, &ikey);
     }
 
     // the message is going to user space, so this is the moment to hand the

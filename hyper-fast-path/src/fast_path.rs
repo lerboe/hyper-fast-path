@@ -1,7 +1,7 @@
 #![allow(unused_imports)]
 use crate::dummies::{DummyMaps, DummyPool, find_dynamic_table_info};
 use anyhow::{Context, Result, bail};
-use beeper::{h1, h2};
+use beeper::{MessageBuffer, h1, h2};
 use httlib_huffman as huffman;
 use std::{
     collections::HashMap,
@@ -295,15 +295,46 @@ impl<'obj> FastPath<'obj> {
         open_skel.maps.rodata_data.as_mut().unwrap().ip4 = ip4;
         open_skel.maps.rodata_data.as_mut().unwrap().port = address.port() as u32;
 
+        // the parsers are only attached once the program is loaded, but the
+        // ids they hand out for their captures have to be in its rodata by
+        // then, so they are configured here and attached further down
+        let mut h1 = h1::Parser::new();
+        let h1_preface = h1.match_h2_preface()?;
+        let h1_path = h1.capture_hdr(beeper::pseudo_header::PATH)?;
+        let h1_content_length = h1.capture_hdr(&http::header::CONTENT_LENGTH)?;
+
+        let mut h2 = h2::Parser::new();
+        let h2_path = h2.capture_hdr(beeper::pseudo_header::PATH)?;
+        let h2_content_length = h2.capture_hdr(&http::header::CONTENT_LENGTH)?;
+
+        let rodata = open_skel.maps.rodata_data.as_mut().unwrap();
+        rodata.h1_preface_mid = h1_preface.into();
+        rodata.h1_path_mid = h1_path.into();
+        rodata.h1_content_length_mid = h1_content_length.into();
+        rodata.h2_path_mid = h2_path.into();
+        rodata.h2_content_length_mid = h2_content_length.into();
+
         // the bodies go into the arena once it exists, all that is loaded here
         // is where each of them will be found
         let bss = open_skel.maps.bss_data.as_mut().unwrap();
-        for (i, PreparedRoute { body, body_off, h2, .. }) in prepared.iter().enumerate() {
+        for (
+            i,
+            PreparedRoute {
+                body, body_off, h2, ..
+            },
+        ) in prepared.iter().enumerate()
+        {
             let route = &mut bss.routes[i];
             route.body_off = *body_off as u32;
             route.body_len = body.len() as u32;
 
-            let Some(H2Response { body, off, sid_offs, data_len }) = h2 else {
+            let Some(H2Response {
+                body,
+                off,
+                sid_offs,
+                data_len,
+            }) = h2
+            else {
                 continue;
             };
             route.h2_body_off = *off as u32;
@@ -336,7 +367,10 @@ impl<'obj> FastPath<'obj> {
         // so a route's offset addresses the same bytes on both sides
         let arena =
             unsafe { std::slice::from_raw_parts_mut(ARENA_BASE as *mut u8, pages * PAGE_SIZE) };
-        for PreparedRoute { body, body_off, h2, .. } in prepared.iter() {
+        for PreparedRoute {
+            body, body_off, h2, ..
+        } in prepared.iter()
+        {
             arena[*body_off..*body_off + body.len()].copy_from_slice(body);
 
             let Some(H2Response { body, off, .. }) = h2 else {
@@ -364,21 +398,16 @@ impl<'obj> FastPath<'obj> {
         let dummy_map_fd = skel.maps.dummy_map.as_fd().as_raw_fd();
         let prog_fd = skel.progs.msg_verdict.as_fd().as_raw_fd();
 
-        let h1 = h1::Parser::new()
-            .match_h2_preface()
-            .capture_hdr(&beeper::header::PATH)
-            .capture_hdr(&http::header::CONTENT_LENGTH)
-            .replace_parse_msg("parse_h1")
-            .replace_extract("extract_h1_match")
-            .replace_matched("matched_h1")
+        let h1 = h1
+            .parse_fn("parse_h1", MessageBuffer::Msg)
+            .extract_fn("extract_h1_match", MessageBuffer::Msg)
+            .matched_fn("matched_h1")
             .attach(prog_fd)?;
 
-        let h2 = h2::Parser::new()
-            .capture_hdr(&beeper::header::PATH)?
-            .capture_hdr(&http::header::CONTENT_LENGTH)?
-            .replace_parse_msg("parse_h2")
-            .replace_extract("extract_h2_match")
-            .replace_get_dynamic_table_entry("get_dt_entry")
+        let h2 = h2
+            .parse_fn("parse_h2", MessageBuffer::Msg)
+            .extract_fn("extract_h2_match", MessageBuffer::Msg)
+            .get_dynamic_table_entry("get_dt_entry")
             .attach(prog_fd)?;
 
         let cgroup_fd = std::fs::OpenOptions::new()
