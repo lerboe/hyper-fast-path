@@ -217,7 +217,7 @@ trap 'exit 1' INT TERM
 
 cargo b -r --bin example
 
-TESTS=(sp)
+TESTS=(fp bl sp)
 PROTOS=("" "--http2")
 FILE_SIZES=(32KB)
 
@@ -237,7 +237,7 @@ for test in "${TESTS[@]}"; do
 
     for proto in "${PROTOS[@]}"; do
         for size in "${FILE_SIZES[@]}"; do
-            for qps in {500..5000..500}; do
+            for qps in {500..20000..500}; do
                 log=$OUT_DIR/$test${proto:+-http2}-${size}-${qps}.log
                 req=http://$SERVER_HOST:$SERVER_PORT/${size}${SUFFIX}.txt
 

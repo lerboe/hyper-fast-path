@@ -28,7 +28,6 @@ PALETTE = {"Baseline": "#0965ef", "Fast Path": "#3fcf4e", "Slow Path": "#e50e3f"
 MARKERS = {"Baseline": "o", "Fast Path": "s", "Slow Path": "^"}
 X_AXES = {"rps": ("rate", "Incoming Rate [rps]"), "size": ("size", "Asset Size [KB]")}
 X_STEP = 2000
-Y_TICKS = [1, 2, 3, 4]
 
 _PATH_PATTERN = re.compile(rf"^({'|'.join(TESTS)})(-http2)?-(.+)-(\d+)$")
 _SIZE_PATTERN = re.compile(r"^(\d+)KB$")
@@ -109,6 +108,8 @@ def export_plot(exp, http2, x_axis, max_x, disabled):
 
     df = df[~df["test"].isin(TESTS[test] for test in disabled)]
 
+    print(df)
+
     order = [test for test in ORDER if test in df["test"].unique()]
 
     fig, ax = plt.subplots(figsize=(6, 3.5))
@@ -121,10 +122,10 @@ def export_plot(exp, http2, x_axis, max_x, disabled):
         style="test",
         style_order=order,
         palette=PALETTE,
-        markers=[MARKERS[test] for test in order],
+        # markers=[MARKERS[test] for test in order],
         dashes=False,
-        markersize=7,
-        linewidth=2,
+        # markersize=7,
+        linewidth=0,
         ax=ax,
     )
 
@@ -140,8 +141,12 @@ def export_plot(exp, http2, x_axis, max_x, disabled):
         ax.set_xlim(right=max_x)
         ax.set_xticks(sorted(df[column].unique()))
 
-    ax.set_ylim(bottom=0, top=Y_TICKS[-1])
-    ax.set_yticks(Y_TICKS)
+    if x_axis == "size":
+        y_ticks = [0.25, 0.5, 0.75, 1]
+    else:
+        y_ticks = [1, 2, 3, 4]
+    ax.set_ylim(bottom=0, top=y_ticks[-1])
+    ax.set_yticks(y_ticks)
     ax.minorticks_off()
     ax.legend(
         title=None,
