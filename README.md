@@ -2,12 +2,12 @@
 
 This is an eBPF-based fast path for [hyper](https://github.com/hyperium/hyper). It parses HTTP/1.1 and HTTP/2 in the kernel using [beeper](https://github.com/lerboe/beeper), and serves requests for static assets. This approach yields significant performance benefits. On my setup, when serving a 32KB asset, the fast path achieves the following performance boost when compared to an [axum](https://github.com/tokio-rs/axum) server[^1]:
 
-| Protocol | Traffic | Latency  | Throughput |
-|----------|---------|----------|------------|
-| HTTP/1.1 | local   | **-54%** | **4.3x**   |
-| HTTP/1.1 | remote  | **-44%** | **3x**     |
-| HTTP/2   | local   | **-53%** | **4.5x**   |
-| HTTP/2   | remote  | **-44%** | **3.4x**   |
+| Protocol | Traffic | Latency @ 2K RPS  | Max Throughput |
+|----------|---------|-------------------|----------------|
+| HTTP/1.1 | local   | **-54%**          | **4.3x**       |
+| HTTP/1.1 | remote  | **-44%**          | **3x**         |
+| HTTP/2   | local   | **-53%**          | **4.5x**       |
+| HTTP/2   | remote  | **-44%**          | **3.4x**       |
 
 ## Running the Example
 
