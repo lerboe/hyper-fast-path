@@ -122,10 +122,10 @@ def export_plot(exp, http2, x_axis, max_x, disabled):
         style="test",
         style_order=order,
         palette=PALETTE,
-        # markers=[MARKERS[test] for test in order],
+        markers=[MARKERS[test] for test in order],
         dashes=False,
-        # markersize=7,
-        linewidth=0,
+        markersize=7,
+        linewidth=2,
         ax=ax,
     )
 
